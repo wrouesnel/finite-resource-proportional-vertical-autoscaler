@@ -79,7 +79,11 @@ count them anyway), or don't match `nodeSelector`.
 
 * `ephemeral-storage` can't be resized in place, so it is only scaled at admission. Running pods
   keep the storage request they were admitted with until they are recreated.
-* Pods using pod-level resources (`spec.resources`) are scaled at admission but not rebalanced.
+* Pods using pod-level resources (`spec.resources`) are rebalanced only on nodes whose kubelet
+  declares the `InPlacePodLevelResourcesVerticalScaling` feature in `status.declaredFeatures`. The API
+  server refuses pod-level resizes on other nodes, so pods there keep the share they were admitted
+  with (they are still counted at their proportional weight). Unscheduled pods are not checked
+  against a node.
 * Running pods can only be resized if the cluster supports in-place pod resize (GA since Kubernetes
   1.35). Resizes the kubelet can't satisfy right away are deferred by the kubelet. Resizes the API
   rejects are recorded as `ProportionalResizeFailed` events on the pod.

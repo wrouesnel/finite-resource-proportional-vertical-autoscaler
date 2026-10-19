@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"time"
 
 	logutil "github.com/wrouesnel/go.logutil"
@@ -41,7 +42,12 @@ const (
 	eventReasonResizeFailed = "ProportionalResizeFailed"
 )
 
-// resizableResources are the resources which can be changed on a running pod.
+// featurePodLevelResize is the feature a node declares when its pods' pod-level resources can be
+// resized in place.
+const featurePodLevelResize = "InPlacePodLevelResourcesVerticalScaling"
+
+// resizableResources are the resources which can be changed on a running pod. These are also the
+// only resources which can be set at the pod level.
 //
 //nolint:gochecknoglobals
 var resizableResources = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
@@ -93,6 +99,7 @@ func nodeChanged() predicate.Predicate {
 			!equality.Semantic.DeepEqual(oldNode.Spec.Taints, newNode.Spec.Taints) ||
 			!equality.Semantic.DeepEqual(oldNode.Labels, newNode.Labels) ||
 			!equality.Semantic.DeepEqual(oldNode.Status.Allocatable, newNode.Status.Allocatable) ||
+			!slices.Equal(oldNode.Status.DeclaredFeatures, newNode.Status.DeclaredFeatures) ||
 			!oldNode.DeletionTimestamp.Equal(newNode.DeletionTimestamp)
 	}}
 }
@@ -110,7 +117,8 @@ func podChanged() predicate.Predicate {
 			oldPod.Annotations[proportional.AnnotationOriginalResources] != newPod.Annotations[proportional.AnnotationOriginalResources] ||
 			oldPod.Annotations[proportional.AnnotationExclude] != newPod.Annotations[proportional.AnnotationExclude] ||
 			!equality.Semantic.DeepEqual(oldPod.Spec.Containers, newPod.Spec.Containers) ||
-			!equality.Semantic.DeepEqual(oldPod.Spec.InitContainers, newPod.Spec.InitContainers)
+			!equality.Semantic.DeepEqual(oldPod.Spec.InitContainers, newPod.Spec.InitContainers) ||
+			!equality.Semantic.DeepEqual(oldPod.Spec.Resources, newPod.Spec.Resources)
 	}}
 }
 
@@ -172,7 +180,7 @@ func (r *Rebalancer) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
-	resizes := r.pendingResizes(state, rebalance.TolerancePercentOrDefault())
+	resizes := r.pendingResizes(ctx, state, rebalance.TolerancePercentOrDefault())
 	if len(resizes) > 0 {
 		if last := status.LastRebalanceTime; last != nil {
 			if wait := last.Add(rebalance.MinIntervalOrDefault()).Sub(r.Now()); wait > 0 {
@@ -262,13 +270,17 @@ type pendingResize struct {
 
 // pendingResizes finds the managed pods whose resizable requests are further than tolerancePercent
 // from their proportional values.
-func (r *Rebalancer) pendingResizes(state *snapshot.Snapshot, tolerancePercent int32) []pendingResize {
+func (r *Rebalancer) pendingResizes(ctx context.Context, state *snapshot.Snapshot, tolerancePercent int32) []pendingResize {
 	var resizes []pendingResize
 	for i := range state.Pods {
 		entry := &state.Pods[i]
 		pod := entry.Pod
-		// Pod-level resources can't be resized in place, so such pods are only scaled on admission.
-		if !entry.Managed() || !pod.DeletionTimestamp.IsZero() || pod.Spec.Resources != nil {
+		if !entry.Managed() || !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if pod.Spec.Resources != nil && !podLevelResizeSupported(state, pod) {
+			logutil.FromCtx(ctx).Debug("Node does not support resizing pod-level resources",
+				zap.String("namespace", pod.Namespace), zap.String("name", pod.Name), zap.String("node", pod.Spec.NodeName))
 			continue
 		}
 		opts := state.Plan.ScaleOptions(state.Classifier.EntryWeight(entry), false)
@@ -281,23 +293,38 @@ func (r *Rebalancer) pendingResizes(state *snapshot.Snapshot, tolerancePercent i
 	return resizes
 }
 
-// resizeTarget is the pod with only the resizable resources of the regular and sidecar containers
-// taken from scaled.
+// podLevelResizeSupported reports whether the pod-level resources of the pod can be resized. The
+// API server refuses unless the pod's node declares support. A pod which is not yet bound to a node
+// is not checked against one.
+func podLevelResizeSupported(state *snapshot.Snapshot, pod *corev1.Pod) bool {
+	if pod.Spec.NodeName == "" {
+		return true
+	}
+	node, ok := state.Nodes[pod.Spec.NodeName]
+	return ok && slices.Contains(node.Status.DeclaredFeatures, featurePodLevelResize)
+}
+
+// resizeTarget is the pod with only the resizable resources of the pod level, and of the regular
+// and sidecar containers, taken from scaled.
 func resizeTarget(pod, scaled *corev1.Pod) *corev1.Pod {
 	out := pod.DeepCopy()
-	copyResizable := func(dst, src []corev1.Container, filter func(*corev1.Container) bool) {
-		for i := range dst {
-			if !filter(&dst[i]) {
-				continue
-			}
-			for _, name := range resizableResources {
-				copyResource(&dst[i].Resources.Requests, src[i].Resources.Requests, name)
-				copyResource(&dst[i].Resources.Limits, src[i].Resources.Limits, name)
-			}
+	copyResizable := func(dst *corev1.ResourceRequirements, src corev1.ResourceRequirements) {
+		for _, name := range resizableResources {
+			copyResource(&dst.Requests, src.Requests, name)
+			copyResource(&dst.Limits, src.Limits, name)
 		}
 	}
-	copyResizable(out.Spec.Containers, scaled.Spec.Containers, func(*corev1.Container) bool { return true })
-	copyResizable(out.Spec.InitContainers, scaled.Spec.InitContainers, isSidecar)
+	for i := range out.Spec.Containers {
+		copyResizable(&out.Spec.Containers[i].Resources, scaled.Spec.Containers[i].Resources)
+	}
+	for i := range out.Spec.InitContainers {
+		if isSidecar(&out.Spec.InitContainers[i]) {
+			copyResizable(&out.Spec.InitContainers[i].Resources, scaled.Spec.InitContainers[i].Resources)
+		}
+	}
+	if out.Spec.Resources != nil && scaled.Spec.Resources != nil {
+		copyResizable(out.Spec.Resources, *scaled.Spec.Resources)
+	}
 	return out
 }
 
@@ -319,27 +346,32 @@ func copyResource(dst *corev1.ResourceList, src corev1.ResourceList, name corev1
 // outOfTolerance reports whether any resizable request of pod is further than tolerancePercent from
 // the request of desired.
 func outOfTolerance(pod, desired *corev1.Pod, tolerancePercent int32) bool {
+	if pod.Spec.Resources != nil && desired.Spec.Resources != nil &&
+		requestsOutOfTolerance(pod.Spec.Resources.Requests, desired.Spec.Resources.Requests, tolerancePercent) {
+		return true
+	}
 	for i := range pod.Spec.Containers {
-		if containerOutOfTolerance(&pod.Spec.Containers[i], &desired.Spec.Containers[i], tolerancePercent) {
+		if requestsOutOfTolerance(pod.Spec.Containers[i].Resources.Requests,
+			desired.Spec.Containers[i].Resources.Requests, tolerancePercent) {
 			return true
 		}
 	}
 	for i := range pod.Spec.InitContainers {
-		if isSidecar(&pod.Spec.InitContainers[i]) &&
-			containerOutOfTolerance(&pod.Spec.InitContainers[i], &desired.Spec.InitContainers[i], tolerancePercent) {
+		if isSidecar(&pod.Spec.InitContainers[i]) && requestsOutOfTolerance(pod.Spec.InitContainers[i].Resources.Requests,
+			desired.Spec.InitContainers[i].Resources.Requests, tolerancePercent) {
 			return true
 		}
 	}
 	return false
 }
 
-func containerOutOfTolerance(current, desired *corev1.Container, tolerancePercent int32) bool {
+func requestsOutOfTolerance(current, desired corev1.ResourceList, tolerancePercent int32) bool {
 	for _, name := range resizableResources {
-		want, ok := desired.Resources.Requests[name]
+		want, ok := desired[name]
 		if !ok {
 			continue
 		}
-		have := current.Resources.Requests[name]
+		have := current[name]
 		w, h := proportional.ToUnits(name, want), proportional.ToUnits(name, have)
 		// |h - w| / w > tolerance
 		drift := new(big.Rat).Abs(big.NewRat(h-w, max(w, 1)))
@@ -397,16 +429,21 @@ func (r *Rebalancer) patchResize(ctx context.Context, from, to *corev1.Pod) erro
 // minResources is desired with each resizable request and limit no larger than in current.
 func minResources(current, desired *corev1.Pod) *corev1.Pod {
 	out := desired.DeepCopy()
-	lower := func(dst []corev1.Container, src []corev1.Container) {
-		for i := range dst {
-			for _, name := range resizableResources {
-				lowerResource(dst[i].Resources.Requests, src[i].Resources.Requests, name)
-				lowerResource(dst[i].Resources.Limits, src[i].Resources.Limits, name)
-			}
+	lower := func(dst *corev1.ResourceRequirements, src corev1.ResourceRequirements) {
+		for _, name := range resizableResources {
+			lowerResource(dst.Requests, src.Requests, name)
+			lowerResource(dst.Limits, src.Limits, name)
 		}
 	}
-	lower(out.Spec.Containers, current.Spec.Containers)
-	lower(out.Spec.InitContainers, current.Spec.InitContainers)
+	for i := range out.Spec.Containers {
+		lower(&out.Spec.Containers[i].Resources, current.Spec.Containers[i].Resources)
+	}
+	for i := range out.Spec.InitContainers {
+		lower(&out.Spec.InitContainers[i].Resources, current.Spec.InitContainers[i].Resources)
+	}
+	if out.Spec.Resources != nil && current.Spec.Resources != nil {
+		lower(out.Spec.Resources, *current.Spec.Resources)
+	}
 	return out
 }
 

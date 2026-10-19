@@ -33,6 +33,8 @@ type Snapshot struct {
 	Classifier *proportional.Classifier
 	Plan       *proportional.Plan
 	Pods       []proportional.PodEntry
+	// Nodes are all nodes of the cluster by name, whether or not they are counted.
+	Nodes map[string]*corev1.Node
 }
 
 // Policy fetches the policy.
@@ -60,7 +62,12 @@ func (l *Loader) Load(ctx context.Context, policy *v1alpha1.ProportionalResource
 		return nil, fmt.Errorf("listing pods: %w", err)
 	}
 	entries := l.Entries.Entries(c, pods.Items)
+	byName := make(map[string]*corev1.Node, len(nodes.Items))
+	for i := range nodes.Items {
+		byName[nodes.Items[i].Name] = &nodes.Items[i]
+	}
 	return &Snapshot{
+		Nodes:      byName,
 		Policy:     policy,
 		Classifier: c,
 		Plan:       proportional.BuildPlan(c, &policy.Spec, nodes.Items, entries),

@@ -88,7 +88,8 @@ func startOperator(t *testing.T, policy *v1alpha1.ProportionalResourcePolicy,
 	for _, ns := range []string{operatorNamespace, "excluded-team", "opted-out"} {
 		c.create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 	}
-	c.addNode("node-1", "900", "900Gi")
+	// Only node-1 runs a kubelet which can resize pod-level resources.
+	c.addNode("node-1", "900", "900Gi", "InPlacePodLevelResourcesVerticalScaling")
 	c.addNode("node-2", "100", "100Gi")
 	c.create(policy)
 	// Shipped empty in the manifests, and filled in by the self-managed certificate rotator.
@@ -150,7 +151,7 @@ func (c *cluster) create(obj client.Object) {
 	}
 }
 
-func (c *cluster) addNode(name, cpu, memory string) {
+func (c *cluster) addNode(name, cpu, memory string, declaredFeatures ...string) {
 	c.t.Helper()
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	c.create(node)
@@ -159,6 +160,7 @@ func (c *cluster) addNode(name, cpu, memory string) {
 		corev1.ResourceMemory: resource.MustParse(memory),
 	}
 	node.Status.Capacity = node.Status.Allocatable
+	node.Status.DeclaredFeatures = declaredFeatures
 	if err := c.client.Status().Update(context.Background(), node); err != nil {
 		c.t.Fatal(err)
 	}
@@ -258,6 +260,41 @@ func (c *cluster) expectResources(pod *corev1.Pod, cpu, memory string) {
 		}
 		if time.Now().After(deadline) {
 			c.t.Fatalf("%s: got cpu=%s memory=%s, want cpu=%s memory=%s",
+				pod.Name, gotCPU.String(), gotMemory.String(), cpu, memory)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// newPodLevelPod is a pod which sets its resources at the pod level only.
+func newPodLevelPod(name, node, cpu, memory string) *corev1.Pod {
+	pod := newPod("default", name, cpu, memory)
+	pod.Spec.NodeName = node
+	pod.Spec.Resources = pod.Spec.Containers[0].Resources.DeepCopy()
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
+	return pod
+}
+
+// expectPodLevelResources waits for the pod to have the given pod-level CPU and memory requests,
+// and checks its containers stay without requests.
+func (c *cluster) expectPodLevelResources(pod *corev1.Pod, cpu, memory string) {
+	c.t.Helper()
+	wantCPU, wantMemory := resource.MustParse(cpu), resource.MustParse(memory)
+	deadline := time.Now().Add(waitTimeout)
+	for {
+		c.get(pod)
+		gotCPU, gotMemory := pod.Spec.Resources.Requests[corev1.ResourceCPU], pod.Spec.Resources.Requests[corev1.ResourceMemory]
+		if gotCPU.Cmp(wantCPU) == 0 && gotMemory.Cmp(wantMemory) == 0 {
+			if gotLimit := pod.Spec.Resources.Limits[corev1.ResourceMemory]; gotLimit.Cmp(wantMemory) != 0 {
+				c.t.Errorf("%s: pod-level memory limit %s, want %s", pod.Name, gotLimit.String(), memory)
+			}
+			if len(pod.Spec.Containers[0].Resources.Requests) != 0 {
+				c.t.Errorf("%s: container requests were added: %v", pod.Name, pod.Spec.Containers[0].Resources.Requests)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatalf("%s: got pod-level cpu=%s memory=%s, want cpu=%s memory=%s",
 				pod.Name, gotCPU.String(), gotMemory.String(), cpu, memory)
 		}
 		time.Sleep(pollInterval)
@@ -414,4 +451,25 @@ func TestOperatorSelfManagedCertificates(t *testing.T) {
 		}
 		time.Sleep(pollInterval)
 	}
+}
+
+func TestOperatorPodLevelResources(t *testing.T) {
+	c := startCluster(t, defaultPolicy())
+
+	resizable := newPodLevelPod("resizable", "node-1", "1", "1Gi")
+	c.create(resizable)
+	c.expectPodLevelResources(resizable, "810", "810Gi")
+
+	// node-2 can't resize pod-level resources, so this pod is only scaled on admission.
+	fixed := newPodLevelPod("fixed", "node-2", "1", "1Gi")
+	c.create(fixed)
+	c.expectPodLevelResources(fixed, "450", "450Gi")
+	c.expectPodLevelResources(resizable, "450", "450Gi")
+
+	// A pod with container-level resources joins with twice the weight.
+	b := newPod("default", "b", "2", "2Gi")
+	c.create(b)
+	c.expectResources(b, "450", "450Gi")
+	c.expectPodLevelResources(resizable, "225", "225Gi")
+	c.expectPodLevelResources(fixed, "450", "450Gi")
 }
