@@ -1,0 +1,99 @@
+---
+# Filled in by the operator's self-managed certificate rotator.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: frpva-webhook-cert
+  namespace: frpva-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frpva-webhook
+  namespace: frpva-system
+spec:
+  selector:
+    app.kubernetes.io/name: frpva
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frpva
+  namespace: frpva-system
+  labels:
+    app.kubernetes.io/name: frpva
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frpva
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frpva
+    spec:
+      serviceAccountName: frpva
+      priorityClassName: system-cluster-critical
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frpva
+          image: ghcr.io/wrouesnel/finite-resource-proportional-vertical-autoscaler:latest
+          args:
+            - --log-format=json
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: webhook
+              containerPort: 9443
+            - name: metrics
+              containerPort: 8080
+            - name: probes
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: frpva-webhook-cert
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frpva
+  namespace: frpva-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frpva

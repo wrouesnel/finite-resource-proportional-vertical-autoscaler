@@ -1,0 +1,33 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: frpva
+webhooks:
+  - name: pods.frpva.wrouesnel.github.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # Pods are admitted unscaled if the operator is unavailable, rather than blocking the cluster.
+    # Such pods are treated as unmanaged (or adopted, if the policy allows).
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    # Run again if a later webhook (e.g. sidecar injection) adds containers.
+    reinvocationPolicy: IfNeeded
+    clientConfig:
+      service:
+        name: frpva-webhook
+        namespace: frpva-system
+        path: /mutate-v1-pod
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
+    # Exclusion patterns are applied by the operator. This only keeps the operator from being asked
+    # about its own pods, and the control plane from depending on it.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["frpva-system", "kube-system"]

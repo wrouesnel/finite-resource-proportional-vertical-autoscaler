@@ -1,0 +1,4 @@
+# Configuration file, loaded from the working directory unless --config-file is set.
+# Keys map to EntrypointConfig in pkg/entrypoints/frpva/config.go. The operator is configured
+# by command line flags and its ProportionalResourcePolicy.
+{}

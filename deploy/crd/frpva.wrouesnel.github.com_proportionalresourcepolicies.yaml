@@ -1,0 +1,383 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: proportionalresourcepolicies.frpva.wrouesnel.github.com
+spec:
+  group: frpva.wrouesnel.github.com
+  names:
+    kind: ProportionalResourcePolicy
+    listKind: ProportionalResourcePolicyList
+    plural: proportionalresourcepolicies
+    shortNames:
+    - prp
+    singular: proportionalresourcepolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.suspend
+      name: Suspended
+      type: boolean
+    - jsonPath: .status.countedNodes
+      name: Nodes
+      type: integer
+    - jsonPath: .status.managedPods
+      name: Managed
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ProportionalResourcePolicy configures the cluster-wide proportional scaling of pod resources.
+          The operator acts on a single policy, named "default" unless configured otherwise.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ProportionalResourcePolicySpec configures the autoscaler.
+            properties:
+              excludedNamespaces:
+                default:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                description: |-
+                  ExcludedNamespaces are namespace names or glob patterns (e.g. "kube-*") whose pods are not
+                  managed. The requests of pods in these namespaces are treated as fixed. The namespace the
+                  operator runs in is always excluded.
+                items:
+                  type: string
+                type: array
+              includeTaintedNodes:
+                description: |-
+                  IncludeTaintedNodes counts nodes with NoSchedule or NoExecute taints when detecting cluster
+                  capacity. By default they are skipped, as are unschedulable (cordoned) and not-ready nodes.
+                type: boolean
+              limitPolicy:
+                default: Proportional
+                description: LimitPolicy controls how container limits are adjusted.
+                enum:
+                - Proportional
+                - Unchanged
+                type: string
+              nodeSelector:
+                description: NodeSelector restricts which nodes are counted when detecting
+                  cluster capacity.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              rebalance:
+                default: {}
+                description: Rebalance configures rebalancing of running pods.
+                properties:
+                  adoptExistingPods:
+                    description: |-
+                      AdoptExistingPods records the current requests of running pods which were never admitted
+                      by the webhook (e.g. those created before the operator was installed) as their proportional
+                      weights, and then manages them like any other pod.
+                    type: boolean
+                  minInterval:
+                    default: 30s
+                    description: MinInterval is the shortest time between two rebalancing
+                      passes.
+                    type: string
+                  mode:
+                    default: InPlace
+                    description: Mode selects how running pods are rebalanced.
+                    enum:
+                    - InPlace
+                    - Disabled
+                    type: string
+                  tolerancePercent:
+                    default: 5
+                    description: |-
+                      TolerancePercent is how far a running container's request may drift from its proportional
+                      value before the pod is resized.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                type: object
+              resources:
+                default:
+                - name: cpu
+                - name: memory
+                - name: ephemeral-storage
+                description: Resources are the finite resources which are shared out
+                  proportionally.
+                items:
+                  description: ResourcePoolSpec configures one finite resource of
+                    the cluster.
+                  properties:
+                    capacity:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: |-
+                        Capacity is the total amount of the resource in the cluster. If unset, it is detected as
+                        the sum of the allocatable resources of the counted nodes, less HeadroomPercent.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    headroomPercent:
+                      default: 10
+                      description: |-
+                        HeadroomPercent is the percentage of detected node allocatable which is held back.
+                        It does not apply when Capacity is set.
+                      format: int32
+                      maximum: 99
+                      minimum: 0
+                      type: integer
+                    minRequest:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: MinRequest is the smallest request any container
+                        will be scaled down to.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    name:
+                      description: Name is the resource to manage.
+                      enum:
+                      - cpu
+                      - memory
+                      - ephemeral-storage
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              subtractUnmanaged:
+                default: true
+                description: |-
+                  SubtractUnmanaged removes the requests of unmanaged pods from the capacity which is shared
+                  out among managed pods.
+                type: boolean
+              suspend:
+                description: Suspend stops both admission-time scaling and rebalancing.
+                type: boolean
+            type: object
+          status:
+            description: ProportionalResourcePolicyStatus is the observed state of
+              the autoscaler.
+            properties:
+              conditions:
+                description: Conditions describe the state of the autoscaler.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              countedNodes:
+                description: CountedNodes is the number of nodes counted towards detected
+                  capacity.
+                format: int32
+                type: integer
+              lastRebalanceTime:
+                description: LastRebalanceTime is when running pods were last rebalanced.
+                format: date-time
+                type: string
+              managedPods:
+                description: ManagedPods is the number of pods being scaled.
+                format: int32
+                type: integer
+              observedGeneration:
+                description: ObservedGeneration is the generation last acted on.
+                format: int64
+                type: integer
+              resources:
+                description: Resources is the state of each managed resource.
+                items:
+                  description: ResourcePoolStatus reports the observed state of one
+                    finite resource.
+                  properties:
+                    available:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: Available is the capacity shared out among managed
+                        pods.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    capacity:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: Capacity is the configured capacity, or the detected
+                        capacity after headroom.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    factor:
+                      description: Factor is the ratio of Available to TotalWeight
+                        by which original requests are scaled.
+                      type: string
+                    name:
+                      description: Name is the resource.
+                      type: string
+                    nodeAllocatable:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: NodeAllocatable is the total allocatable resource
+                        of the counted nodes.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    totalWeight:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: TotalWeight is the sum of the original requests
+                        of all managed pods.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    unmanaged:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: Unmanaged is the total request of unmanaged pods
+                        on counted nodes.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                  required:
+                  - available
+                  - capacity
+                  - factor
+                  - name
+                  - nodeAllocatable
+                  - totalWeight
+                  - unmanaged
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              unmanagedPods:
+                description: UnmanagedPods is the number of pods on counted nodes
+                  which are not being scaled.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

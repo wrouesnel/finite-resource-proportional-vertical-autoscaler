@@ -1,0 +1,23 @@
+---
+apiVersion: frpva.wrouesnel.github.com/v1alpha1
+kind: ProportionalResourcePolicy
+metadata:
+  name: default
+spec:
+  resources:
+    - name: cpu
+      headroomPercent: 10
+      minRequest: 1m
+    - name: memory
+      headroomPercent: 10
+      minRequest: 16Mi
+    - name: ephemeral-storage
+      headroomPercent: 10
+  excludedNamespaces:
+    - kube-*
+  limitPolicy: Proportional
+  rebalance:
+    mode: InPlace
+    tolerancePercent: 5
+    minInterval: 30s
+    adoptExistingPods: false

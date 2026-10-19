@@ -1,179 +1,193 @@
-# cluster-proportional-vertical-autoscaler (BETA)
+# finite-resource-proportional-vertical-autoscaler
 
-[![Build Status](https://travis-ci.org/kubernetes-sigs/cluster-proportional-vertical-autoscaler.svg)](https://travis-ci.org/kubernetes-sigs/cluster-proportional-vertical-autoscaler)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler)](https://goreportcard.com/report/github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler)
+A cluster-wide Kubernetes operator which treats the resource requests of every pod as *proportional
+weights*, rather than absolute amounts, and scales them so that together they exactly fill the
+finite resources of the cluster.
 
-## Overview
+A pod submitted asking for `cpu: 100m` doesn't get 100 millicores. It gets 100 parts of the cluster's
+CPU, where the other parts are the requests of every other managed pod. If the cluster has 90 cores
+to share and the managed pods ask for 3 cores in total, every request is multiplied by 30. When
+another pod joins, everyone's share shrinks; when one leaves, everyone grows into the space.
 
-This container image watches over the number of nodes and cores of the cluster and resizes
-the resource limits and requests for a DaemonSet, ReplicaSet, StatefulSet, or Deployment. This functionality 
-may be desirable for applications where resources such as cpu and memory for a particular job need 
-to be autoscaled with the size of the cluster.
+## How it works
 
-Usage of cluster-proportional-vertical-autoscaler:
+The operator is a single binary which runs two things:
 
-```
-      --alsologtostderr[=false]: log to standard error as well as files
-      --config-file: The default configuration (in JSON format).
-      --default-config: A config file (in JSON format), which overrides the --default-config.
-      --kube-config="": Path to a kubeconfig. Only required if running out-of-cluster.
-      --log-backtrace-at=:0: when logging hits line file:N, emit a stack trace
-      --log-dir="": If non-empty, write log files in this directory
-      --logtostderr[=false]: log to standard error instead of files
-      --namespace="": The Namespace of the --target. Defaults to ${MY_NAMESPACE}.
-      --poll-period-seconds=10: The period, in seconds, to poll cluster size and perform autoscaling.
-      --stderrthreshold=2: logs at or above this threshold go to stderr
-      --target="": Target to scale. In format: deployment/*, replicaset/* or daemonset/* (not case sensitive).
-      --v=0: log level for V logs
-      --version[=false]: Print the version and exit.
-      --vmodule=: comma-separated list of pattern=N settings for file-filtered logging
-```
+* **A mutating admission webhook** on every replica. When a pod is created (from any source:
+  Deployments, Jobs, operators, bare pods), it records the pod's submitted requests and limits in
+  the managed `frpva.wrouesnel.github.com/original-resources` annotation, and rewrites the requests
+  to the pod's proportional share of the cluster.
+* **A rebalancing controller** on the elected leader. It watches pods, nodes and the policy, and
+  resizes running pods in place (through the `pods/resize` subresource) whenever their share drifts
+  from what they hold: because pods arrived or left, nodes were added, removed or cordoned, or the
+  policy changed.
 
-## Examples
+### The calculation
 
-Please try out the examples in [the examples folder](examples/README.md).
-
-## Implementation Details
-
-The code in this module is a Kubernetes Golang API client that, using the default service account credentials
-available to Golang clients running inside pods, it connects to the API server and polls for the number of nodes
-and cores in the cluster.
-
-The scaling parameters and data points are provided via a config file in JSON format to the autoscaler and it 
-refreshes its parameters table every poll interval to be up to date with the latest desired scaling parameters.
-
-### Calculation of resource requests and limits
-
-The resource requests and limits are computed by using the number of cores and nodes as input as well as
-the provided step values bounded by provided base and max values.
-
-Example:
+For each managed resource (`cpu`, `memory`, `ephemeral-storage`):
 
 ```
-Base = 10
-Max = 100
-Step = 2
-CoresPerStep = 4
-NodesPerStep = 2
+capacity  = configured capacity, or (sum of allocatable of counted nodes) * (100 - headroomPercent)%
+available = capacity - requests of unmanaged pods on counted nodes - pod overhead of managed pods
+weight    = sum over managed pods of the pod's original effective request
+factor    = available / weight
 
-The core and node counts are rounded up to the next whole step.
-
-If we find 64 cores and 4 nodes we get scalars of:
-  by-cores: 10 + (2 * (round(64, 4)/4)) = 10 + 32 = 42
-  by-nodes: 10 + (2 * (round(4, 2)/2)) = 10 + 4 = 14
-  
-The larger is by-cores, and it is less than Max, so the final value is 42.
-
-If we find 3 cores and 3 nodes we get scalars of:
-  by-cores: 10 + (2 * (round(3, 4)/4)) = 10 + 2 = 12
-  by-nodes: 10 + (2 * (round(3, 2)/2)) = 10 + 4 = 14
+scaled request of each container = original request * factor
 ```
 
-## Config parameters
+The default headroom is 10%, so the auto-detected capacity is 90% of what the nodes report.
 
-The configuration should be in JSON format and supports the following parameters:
-  - **base** The baseline quantity required.
-  - **max**  The maximum allowed quantity.
-  - **step** The amount of additional resources to grow by.  If this is too fine-grained, the resizing action will happen too frequently.
-  - **coresPerStep** The number of cores required to trigger an increase.
-  - **nodesPerStep** The number of nodes required to trigger an increase.
-      
-Example:
+The pod's *effective* request is computed the way the scheduler does (`max(init containers,
+containers + sidecars)`, or pod-level resources when set). Every container of every pod is scaled by
+the same factor, so effective requests scale by that factor too, and the managed pods together
+request exactly `available`.
 
-```
-"containerA": {
-  "requests": {
-    "cpu": {
-      "base": "10m", "step":"1m", "coresPerStep":1
-    },
-    "memory": {
-      "base": "8Mi", "step":"1Mi", "coresPerStep":1
-    }
-  }
-"containerB": {
-  "requests": {
-    "cpu": {
-      "base": "250m", "step":"100m", "coresPerStep":10
-    },
-  }
-}
-```
+A few refinements:
 
-## Running the cluster-proportional-vertical-autoscaler
-This repo includes an example yaml files in the "examples" directory that can be used as examples demonstrating 
-how to use the vertical autoscaler.
+* **No pod is scaled beyond what fits on a node.** A pod's factor is capped so its effective request
+  doesn't exceed the largest counted node's allocatable (less headroom). Capacity freed by the cap
+  isn't redistributed.
+* **Limits** follow the `limitPolicy`. With `Proportional` (the default) limits are scaled by the same
+  factor, which keeps every container's limit:request ratio and so its QoS class. Guaranteed pods stay
+  Guaranteed, which matters because in-place resizes may not change the QoS class. With `Unchanged`
+  the submitted limits are kept and only raised where the scaled request would exceed them.
+* **Rounding.** CPU is rounded to the millicore and memory and storage to the KiB. Nothing is scaled
+  below one unit or the pool's `minRequest`. Resources a container doesn't request (or requests as
+  `0`) are left alone, so BestEffort pods stay BestEffort.
+* **Rebalancing is damped.** A running pod is only resized when a request is more than
+  `tolerancePercent` (default 5%) away from its proportional value, and resize passes run at most every
+  `minInterval` (default 30s). Each pass applies all decreases before any increases, so growing pods
+  have room to grow into.
 
-For example, consider a Deployment that needs to scale its resources (cpu, memory, etc...) proportional to the number of
-cores in a cluster.
+### What is managed
+
+A pod is managed unless:
+
+* its namespace matches one of `excludedNamespaces` (exact names or globs, e.g. `kube-*`). The
+  operator's own namespace is always excluded.
+* it is annotated `frpva.wrouesnel.github.com/exclude: "true"`.
+* it is a static (mirror) pod.
+
+Unmanaged pods keep their requests, and the requests they hold are subtracted from the capacity shared
+among managed pods (set `subtractUnmanaged: false` to stop this).
+
+Nodes count towards the detected capacity unless they are cordoned, being deleted, have a
+`NoSchedule`/`NoExecute` taint (e.g. control-plane or not-ready nodes; set `includeTaintedNodes` to
+count them anyway), or don't match `nodeSelector`.
+
+### Limitations
+
+* `ephemeral-storage` can't be resized in place, so it is only scaled at admission. Running pods
+  keep the storage request they were admitted with until they are recreated.
+* Pods using pod-level resources (`spec.resources`) are scaled at admission but not rebalanced.
+* Running pods can only be resized if the cluster supports in-place pod resize (GA since Kubernetes
+  1.35). Resizes the kubelet can't satisfy right away are deferred by the kubelet. Resizes the API
+  rejects are recorded as `ProportionalResizeFailed` events on the pod.
+* The operator owns the requests of managed pods. If someone resizes a managed pod by hand, the next
+  rebalance puts it back to its proportional share. To change a pod's weight, change the request in
+  its controller's pod template so new pods are admitted with the new weight.
+* Pods created while the webhook is unavailable are admitted as submitted (the webhook fails open) and
+  treated as unmanaged, unless `rebalance.adoptExistingPods` is set.
+
+## Configuration
+
+The operator acts on the cluster-scoped `ProportionalResourcePolicy` named `default` (set with
+`--policy-name`). Until that policy exists, the operator does nothing.
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: frpva.wrouesnel.github.com/v1alpha1
+kind: ProportionalResourcePolicy
 metadata:
-  name: thing
-  namespace: kube-system
-  labels:
-    k8s-app: thing
+  name: default
 spec:
-  replicas: 3
-  selector:
+  # Stop scaling and rebalancing without uninstalling.
+  suspend: false
+  resources:
+    - name: cpu
+      headroomPercent: 10   # held back from detected capacity
+      minRequest: 1m
+    - name: memory
+      # An explicit capacity replaces detection.
+      capacity: 512Gi
+      minRequest: 16Mi
+    - name: ephemeral-storage
+  excludedNamespaces:
+    - kube-*
+    - monitoring
+  nodeSelector:
     matchLabels:
-      k8s-app: thing
-  template:
-    metadata:
-      labels:
-        k8s-app: thing
-    spec:
-      containers:
-      - image: nginx
-        name: thing
+      node-role.kubernetes.io/worker: ""
+  includeTaintedNodes: false
+  subtractUnmanaged: true
+  limitPolicy: Proportional   # or Unchanged
+  rebalance:
+    mode: InPlace             # or Disabled, to only scale at admission
+    tolerancePercent: 5
+    minInterval: 30s
+    # Record the current requests of pods which predate the operator as their weights, and manage them.
+    adoptExistingPods: false
 ```
 
-```bash
-kubectl create -f thing.yaml
+The status reports what the operator sees:
+
+```console
+$ kubectl get prp
+NAME      SUSPENDED   NODES   MANAGED   READY   AGE
+default   false       12      340       True    3d
+$ kubectl get prp default -o jsonpath='{.status.resources[0]}'
+{"available":"86","capacity":"97200m","factor":"27.5641","name":"cpu","nodeAllocatable":"108","totalWeight":"3120m","unmanaged":"11200m"}
 ```
 
+## Installing
 
-The below config will scale the above defined deployment's CPU resource by "100m" step size
-for every 10 nodes that are added to the cluster.
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: thing-autoscaler
-  namespace: kube-system
-  labels:
-    k8s-app: thing-autoscaler
-    kubernetes.io/cluster-service: "true"
-    addonmanager.kubernetes.io/mode: Reconcile
-spec:
-  selector:
-    matchLabels:
-      k8s-app: thing-autoscaler
-  template:
-    metadata:
-      labels:
-        k8s-app: thing-autoscaler
-      annotations:
-        scheduler.alpha.kubernetes.io/critical-pod: ''
-    spec:
-      containers:
-      - name: autoscaler
-        image: registry.k8s.io/cpvpa-amd64:v0.8.1
-        resources:
-          requests:
-            cpu: "20m"
-            memory: "10Mi"
-        command:
-          - /cpvpa
-          - --target=deployment/thing
-          - --namespace=kube-system
-          - --logtostderr=true
-          - --poll-period-seconds=10
-          - --default-config={"thing":{"requests":{"cpu":{"base":"250m","step":"100m","nodesPerStep":10}}}}
-      tolerations:
-      - key: "CriticalAddonsOnly"
-        operator: "Exists"
-      serviceAccountName: thing-autoscaler
+```sh
+kubectl apply -k deploy/
+kubectl apply -f deploy/policy.yaml
 ```
+
+This installs the CRD, the operator (two replicas in `frpva-system`), its RBAC, and the
+`MutatingWebhookConfiguration`. Apply the policy once the CRD exists.
+
+By default the operator generates and rotates its own webhook certificate, storing it in the
+`frpva-webhook-cert` secret and injecting the CA into the webhook configuration. To use cert-manager
+instead, run with `--webhook-cert-mode=external`, mount the certificate at `--webhook-cert-dir`, and
+let cert-manager's CA injector set the `caBundle`.
+
+The webhook configuration's `namespaceSelector` keeps the API server from calling the webhook for
+`kube-system` and `frpva-system`. All other exclusions are applied by the operator from the policy.
+
+## Building
+
+```sh
+go run mage.go binary   # builds bin/ and symlinks ./frpva
+go run mage.go test     # unit tests, plus integration tests against an envtest control plane
+go run mage.go lint
+go run mage.go style
+```
+
+`go run mage.go test` downloads the envtest `kube-apiserver` and `etcd` binaries into `.bin/envtest`.
+The integration tests run the operator through its entrypoint against a real API server, and check
+admission scaling, in-place rebalancing, exclusions, adoption and certificate management.
+
+The CRD and deepcopy code are generated by `controller-gen` from `pkg/apis/v1alpha1`, which
+`go generate ./...` runs (and every mage build target runs).
+
+## Layout
+
+| Path | Purpose |
+|---|---|
+| `cmd/frpva` | Minimal `main` which calls the entrypoint. |
+| `pkg/entrypoints/frpva` | Command line, logging, and wiring of the manager, webhook and certificates. |
+| `pkg/apis/v1alpha1` | The `ProportionalResourcePolicy` API. |
+| `pkg/proportional` | The calculation: original resources annotation, classification, plan and scaling. |
+| `pkg/snapshot` | Reads the cluster state the webhook and controller share. |
+| `pkg/webhook` | The pod mutating admission webhook. |
+| `pkg/controller` | The rebalancing controller. |
+| `deploy/` | Kustomize manifests. `deploy/crd` is generated. |
+
+## History
+
+This repository started as a fork of
+[cluster-proportional-vertical-autoscaler](https://github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler),
+which scales a single workload with the size of the cluster. It has since been rewritten around a
+different idea: every workload shares out the cluster in proportion to what it asks for.

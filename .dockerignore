@@ -1,0 +1,11 @@
+# Keep .git: the build uses `git describe` to stamp the version.
+/bin/
+/release/
+/.coverage/
+/.cover.out
+/.junit/
+/.bin/
+/.node/
+/.node.tmp/
+/web/node_modules/
+/web/dist/
