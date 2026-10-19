@@ -33,6 +33,9 @@ jobs:
           go-version-file: go.mod
       - name: Lint
         run: go run mage.go lint
+        env:
+          # Loading the Kubernetes dependencies on a cold runner takes longer than the default minute.
+          LINTER_DEADLINE: 10m
 
   test:
     runs-on: ubuntu-latest
